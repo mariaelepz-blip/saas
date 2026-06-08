@@ -1,0 +1,287 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Auth (plataforma SaaS) ----------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  passwordHash  String?
+  emailVerified DateTime?
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  instagramAccounts InstagramAccount[]
+  mediaAssets       MediaAsset[]
+  notifications     Notification[]
+}
+
+// ---------- Contas do Instagram conectadas via Meta Graph API ----------
+
+enum AccountStatus {
+  CONNECTED       // token válido, conta ativa
+  WARMING         // dentro do pipeline de aquecimento
+  TOKEN_EXPIRED   // precisa reautenticar
+  ACTION_REQUIRED // Meta sinalizou revisão/restrição
+  DISCONNECTED    // desconectada/banida pelo usuário ou pela Meta
+}
+
+model InstagramAccount {
+  id                String        @id @default(cuid())
+  userId            String
+  user              User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  igUserId          String        @unique // Instagram Business Account ID (Graph API)
+  igUsername        String
+  facebookPageId    String
+  facebookPageName  String?
+  profilePictureUrl String?
+
+  accessToken       String        @db.Text // long-lived token (criptografado em produção)
+  tokenExpiresAt    DateTime?
+
+  status            AccountStatus @default(CONNECTED)
+  lastSyncedAt      DateTime?
+  lastError         String?
+
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  scheduledPosts    ScheduledPost[]
+  warmingPlan       WarmingPlan?
+  insightsSnapshots InsightSnapshot[]
+  activityLogs      AccountActivityLog[]
+
+  @@index([userId])
+}
+
+// ---------- Esteira de aquecimento ----------
+// Pipeline configurável de etapas (frequência/volume de publicações,
+// intervalos entre ações) respeitando os limites da Graph API.
+// Não simula comportamento humano nem login não-oficial.
+
+enum WarmingStageStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  PAUSED
+}
+
+model WarmingPlan {
+  id                 String    @id @default(cuid())
+  instagramAccountId String    @unique
+  instagramAccount   InstagramAccount @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+
+  currentStage       Int       @default(1)
+  totalStages        Int       @default(4)
+  startedAt          DateTime  @default(now())
+  estimatedEndAt     DateTime?
+  status             WarmingStageStatus @default(IN_PROGRESS)
+
+  stages             WarmingStage[]
+
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+}
+
+model WarmingStage {
+  id              String   @id @default(cuid())
+  warmingPlanId   String
+  warmingPlan     WarmingPlan @relation(fields: [warmingPlanId], references: [id], onDelete: Cascade)
+
+  order           Int
+  name            String   // ex: "Semana 1 - Engajamento leve"
+  durationDays    Int
+  postsPerDay     Int
+  storiesPerDay   Int
+  minIntervalMins Int      @default(120)
+
+  status          WarmingStageStatus @default(PENDING)
+
+  createdAt       DateTime @default(now())
+
+  @@unique([warmingPlanId, order])
+}
+
+// ---------- Biblioteca de mídia + variações anti-duplicidade ----------
+
+enum MediaType {
+  IMAGE
+  VIDEO
+}
+
+enum ProcessingStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+model MediaAsset {
+  id          String     @id @default(cuid())
+  userId      String
+  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type        MediaType
+  originalUrl String     @db.Text
+  fileName    String
+  durationSec Float?
+  width       Int?
+  height      Int?
+
+  createdAt   DateTime   @default(now())
+
+  variants    MediaVariant[]
+  scheduledPosts ScheduledPost[]
+}
+
+// Cada variante representa uma versão processada (espelhada/filtrada/etc)
+// gerada para evitar detecção de conteúdo duplicado entre contas.
+model MediaVariant {
+  id            String           @id @default(cuid())
+  mediaAssetId  String
+  mediaAsset    MediaAsset       @relation(fields: [mediaAssetId], references: [id], onDelete: Cascade)
+
+  status        ProcessingStatus @default(PENDING)
+  outputUrl     String?          @db.Text
+
+  // transformações aplicadas
+  mirrored      Boolean          @default(false)
+  textPreserved Boolean          @default(false) // reaplica overlays de texto não-espelhados
+  filter        String?          // ex: "warm-light", "contrast-soft", "saturation-boost"
+  speedFactor   Float?           // ex: 1.02 (leve variação de velocidade)
+  cropPercent   Float?           // leve corte de bordas para alterar hash/dimensões
+  brightness    Float?
+  saturation    Float?
+
+  errorMessage  String?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+}
+
+// ---------- Agendamento de publicações ----------
+
+enum PostType {
+  FEED
+  REEL
+  STORY
+  CAROUSEL
+}
+
+enum PostStatus {
+  DRAFT
+  SCHEDULED
+  PUBLISHING
+  PUBLISHED
+  FAILED
+  CANCELED
+}
+
+model ScheduledPost {
+  id                 String     @id @default(cuid())
+  instagramAccountId String
+  instagramAccount   InstagramAccount @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+
+  mediaAssetId       String?
+  mediaAsset         MediaAsset? @relation(fields: [mediaAssetId], references: [id])
+  mediaVariantId     String?    // variante específica (anti-duplicidade) usada nesta publicação
+
+  type               PostType
+  caption            String?    @db.Text
+  hashtags           String?    @db.Text
+
+  scheduledFor       DateTime
+  status             PostStatus @default(SCHEDULED)
+
+  igMediaId          String?    // ID retornado pela Graph API após publicação
+  publishedAt        DateTime?
+  errorMessage       String?
+  attempts           Int        @default(0)
+
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+
+  @@index([instagramAccountId, scheduledFor])
+  @@index([status, scheduledFor])
+}
+
+// ---------- Insights / métricas (via Graph API) ----------
+
+model InsightSnapshot {
+  id                 String   @id @default(cuid())
+  instagramAccountId String
+  instagramAccount   InstagramAccount @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+
+  followersCount     Int?
+  followsCount       Int?
+  mediaCount         Int?
+  reach              Int?
+  impressions        Int?
+  profileViews       Int?
+
+  capturedAt         DateTime @default(now())
+
+  @@index([instagramAccountId, capturedAt])
+}
+
+// ---------- Log de atividades por conta (auditoria / troubleshooting) ----------
+
+enum ActivityType {
+  CONNECTED
+  TOKEN_REFRESHED
+  POST_PUBLISHED
+  POST_FAILED
+  STATUS_CHANGED
+  WARMING_STAGE_ADVANCED
+}
+
+model AccountActivityLog {
+  id                 String       @id @default(cuid())
+  instagramAccountId String
+  instagramAccount   InstagramAccount @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+
+  type               ActivityType
+  message            String
+  metadata           Json?
+
+  createdAt          DateTime     @default(now())
+
+  @@index([instagramAccountId, createdAt])
+}
+
+// ---------- Notificações para o usuário ----------
+
+enum NotificationType {
+  ACCOUNT_DISCONNECTED
+  TOKEN_EXPIRING
+  POST_PUBLISHED
+  POST_FAILED
+  WARMING_STAGE_COMPLETE
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type      NotificationType
+  title     String
+  message   String
+  read      Boolean          @default(false)
+
+  createdAt DateTime         @default(now())
+
+  @@index([userId, read])
+}
